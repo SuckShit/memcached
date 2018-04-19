@@ -3,6 +3,9 @@
  * Thread management for memcached.
  */
 #include "memcached.h"
+#ifdef EXTSTORE
+#include "storage.h"
+#endif
 #include <assert.h>
 #include <stdio.h>
 #include <errno.h>
@@ -17,6 +20,10 @@
 #define ITEMS_PER_ALLOC 64
 
 /* An item in the connection queue. */
+enum conn_queue_item_modes {
+    queue_new_conn,   /* brand new connection. */
+    queue_redispatch, /* redispatching from side thread */
+};
 typedef struct conn_queue_item CQ_ITEM;
 struct conn_queue_item {
     int               sfd;
@@ -24,6 +31,7 @@ struct conn_queue_item {
     int               event_flags;
     int               read_buffer_size;
     enum network_transport     transport;
+    enum conn_queue_item_modes mode;
     conn *c;
     CQ_ITEM          *next;
 };
@@ -79,36 +87,6 @@ static pthread_cond_t init_cond;
 
 static void thread_libevent_process(int fd, short which, void *arg);
 
-unsigned short refcount_incr(unsigned short *refcount) {
-#ifdef HAVE_GCC_ATOMICS
-    return __sync_add_and_fetch(refcount, 1);
-#elif defined(__sun)
-    return atomic_inc_ushort_nv(refcount);
-#else
-    unsigned short res;
-    mutex_lock(&atomics_mutex);
-    (*refcount)++;
-    res = *refcount;
-    mutex_unlock(&atomics_mutex);
-    return res;
-#endif
-}
-
-unsigned short refcount_decr(unsigned short *refcount) {
-#ifdef HAVE_GCC_ATOMICS
-    return __sync_sub_and_fetch(refcount, 1);
-#elif defined(__sun)
-    return atomic_dec_ushort_nv(refcount);
-#else
-    unsigned short res;
-    mutex_lock(&atomics_mutex);
-    (*refcount)--;
-    res = *refcount;
-    mutex_unlock(&atomics_mutex);
-    return res;
-#endif
-}
-
 /* item_lock() must be held for an item before any modifications to either its
  * associated hash bucket, or the structure itself.
  * LRU modifications must hold the item lock, and the LRU lock.
@@ -161,17 +139,23 @@ void pause_threads(enum pause_thread_types type) {
     buf[0] = 0;
     switch (type) {
         case PAUSE_ALL_THREADS:
+            lru_maintainer_pause();
             slabs_rebalancer_pause();
             lru_crawler_pause();
-            lru_maintainer_pause();
+#ifdef EXTSTORE
+            storage_compact_pause();
+#endif
         case PAUSE_WORKER_THREADS:
             buf[0] = 'p';
             pthread_mutex_lock(&worker_hang_lock);
             break;
         case RESUME_ALL_THREADS:
+            lru_maintainer_resume();
             slabs_rebalancer_resume();
             lru_crawler_resume();
-            lru_maintainer_resume();
+#ifdef EXTSTORE
+            storage_compact_resume();
+#endif
         case RESUME_WORKER_THREADS:
             pthread_mutex_unlock(&worker_hang_lock);
             break;
@@ -325,7 +309,16 @@ void accept_new_conns(const bool do_accept) {
  * Set up a thread's information.
  */
 static void setup_thread(LIBEVENT_THREAD *me) {
+#if defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER >= 0x02000101
+    struct event_config *ev_config;
+    ev_config = event_config_new();
+    event_config_set_flag(ev_config, EVENT_BASE_FLAG_NOLOCK);
+    me->base = event_base_new_with_config(ev_config);
+    event_config_free(ev_config);
+#else
     me->base = event_init();
+#endif
+
     if (! me->base) {
         fprintf(stderr, "Can't allocate event base\n");
         exit(1);
@@ -359,6 +352,13 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         fprintf(stderr, "Failed to create suffix cache\n");
         exit(EXIT_FAILURE);
     }
+#ifdef EXTSTORE
+    me->io_cache = cache_create("io", sizeof(io_wrap), sizeof(char*), NULL, NULL);
+    if (me->io_cache == NULL) {
+        fprintf(stderr, "Failed to create IO object cache\n");
+        exit(EXIT_FAILURE);
+    }
+#endif
 }
 
 /*
@@ -371,13 +371,20 @@ static void *worker_libevent(void *arg) {
      * all threads have finished initializing.
      */
     me->l = logger_create();
-    if (me->l == NULL) {
+    me->lru_bump_buf = item_lru_bump_buf_create();
+    if (me->l == NULL || me->lru_bump_buf == NULL) {
         abort();
+    }
+
+    if (settings.drop_privileges) {
+        drop_worker_privileges();
     }
 
     register_thread_initialized();
 
     event_base_loop(me->base, 0);
+
+    event_base_free(me->base);
     return NULL;
 }
 
@@ -390,6 +397,7 @@ static void thread_libevent_process(int fd, short which, void *arg) {
     LIBEVENT_THREAD *me = arg;
     CQ_ITEM *item;
     char buf[1];
+    conn *c;
     unsigned int timeout_fd;
 
     if (read(fd, buf, 1) != 1) {
@@ -402,34 +410,35 @@ static void thread_libevent_process(int fd, short which, void *arg) {
     case 'c':
         item = cq_pop(me->new_conn_queue);
 
-        if (NULL != item) {
-            conn *c = conn_new(item->sfd, item->init_state, item->event_flags,
-                               item->read_buffer_size, item->transport,
-                               me->base);
-            if (c == NULL) {
-                if (IS_UDP(item->transport)) {
-                    fprintf(stderr, "Can't listen for events on UDP socket\n");
-                    exit(1);
-                } else {
-                    if (settings.verbose > 0) {
-                        fprintf(stderr, "Can't listen for events on fd %d\n",
-                            item->sfd);
+        if (NULL == item) {
+            break;
+        }
+        switch (item->mode) {
+            case queue_new_conn:
+                c = conn_new(item->sfd, item->init_state, item->event_flags,
+                                   item->read_buffer_size, item->transport,
+                                   me->base);
+                if (c == NULL) {
+                    if (IS_UDP(item->transport)) {
+                        fprintf(stderr, "Can't listen for events on UDP socket\n");
+                        exit(1);
+                    } else {
+                        if (settings.verbose > 0) {
+                            fprintf(stderr, "Can't listen for events on fd %d\n",
+                                item->sfd);
+                        }
+                        close(item->sfd);
                     }
-                    close(item->sfd);
+                } else {
+                    c->thread = me;
                 }
-            } else {
-                c->thread = me;
-            }
-            cqi_free(item);
-        }
-        break;
-    case 'r':
-        item = cq_pop(me->new_conn_queue);
+                break;
 
-        if (NULL != item) {
-            conn_worker_readd(item->c);
-            cqi_free(item);
+            case queue_redispatch:
+                conn_worker_readd(item->c);
+                break;
         }
+        cqi_free(item);
         break;
     /* we were told to pause and report in */
     case 'p':
@@ -477,6 +486,7 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
     item->event_flags = event_flags;
     item->read_buffer_size = read_buffer_size;
     item->transport = transport;
+    item->mode = queue_new_conn;
 
     cq_push(thread->new_conn_queue, item);
 
@@ -504,10 +514,11 @@ void redispatch_conn(conn *c) {
     item->sfd = c->sfd;
     item->init_state = conn_new_cmd;
     item->c = c;
+    item->mode = queue_redispatch;
 
     cq_push(thread->new_conn_queue, item);
 
-    buf[0] = 'r';
+    buf[0] = 'c';
     if (write(thread->notify_send_fd, buf, 1) != 1) {
         perror("Writing to thread notify pipe");
     }
@@ -543,12 +554,12 @@ item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbyt
  * Returns an item if it hasn't been marked as expired,
  * lazy-expiring as needed.
  */
-item *item_get(const char *key, const size_t nkey, conn *c) {
+item *item_get(const char *key, const size_t nkey, conn *c, const bool do_update) {
     item *it;
     uint32_t hv;
     hv = hash(key, nkey);
     item_lock(hv);
-    it = do_item_get(key, nkey, hv, c);
+    it = do_item_get(key, nkey, hv, c, do_update);
     item_unlock(hv);
     return it;
 }
@@ -611,22 +622,10 @@ void item_unlink(item *item) {
 }
 
 /*
- * Moves an item to the back of the LRU queue.
- */
-void item_update(item *item) {
-    uint32_t hv;
-    hv = hash(ITEM_key(item), item->nkey);
-
-    item_lock(hv);
-    do_item_update(item);
-    item_unlock(hv);
-}
-
-/*
  * Does arithmetic on a numeric item value.
  */
 enum delta_result_type add_delta(conn *c, const char *key,
-                                 const size_t nkey, int incr,
+                                 const size_t nkey, bool incr,
                                  const int64_t delta, char *buf,
                                  uint64_t *cas) {
     enum delta_result_type ret;
@@ -669,10 +668,15 @@ void threadlocal_stats_reset(void) {
         pthread_mutex_lock(&threads[ii].stats.mutex);
 #define X(name) threads[ii].stats.name = 0;
         THREAD_STATS_FIELDS
+#ifdef EXTSTORE
+        EXTSTORE_THREAD_STATS_FIELDS
+#endif
 #undef X
 
         memset(&threads[ii].stats.slab_stats, 0,
                 sizeof(threads[ii].stats.slab_stats));
+        memset(&threads[ii].stats.lru_hits, 0,
+                sizeof(uint64_t) * POWER_LARGEST);
 
         pthread_mutex_unlock(&threads[ii].stats.mutex);
     }
@@ -689,6 +693,9 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
         pthread_mutex_lock(&threads[ii].stats.mutex);
 #define X(name) stats->name += threads[ii].stats.name;
         THREAD_STATS_FIELDS
+#ifdef EXTSTORE
+        EXTSTORE_THREAD_STATS_FIELDS
+#endif
 #undef X
 
         for (sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
@@ -696,6 +703,13 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
             threads[ii].stats.slab_stats[sid].name;
             SLAB_STATS_FIELDS
 #undef X
+        }
+
+        for (sid = 0; sid < POWER_LARGEST; sid++) {
+            stats->lru_hits[sid] +=
+                threads[ii].stats.lru_hits[sid];
+            stats->slab_stats[CLEAR_LRU(sid)].get_hits +=
+                threads[ii].stats.lru_hits[sid];
         }
 
         pthread_mutex_unlock(&threads[ii].stats.mutex);
@@ -719,7 +733,7 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
  *
  * nthreads  Number of worker event handler threads to spawn
  */
-void memcached_thread_init(int nthreads) {
+void memcached_thread_init(int nthreads, void *arg) {
     int         i;
     int         power;
 
@@ -741,9 +755,13 @@ void memcached_thread_init(int nthreads) {
         power = 11;
     } else if (nthreads < 5) {
         power = 12;
-    } else {
-        /* 8192 buckets, and central locks don't scale much past 5 threads */
+    } else if (nthreads <= 10) {
         power = 13;
+    } else if (nthreads <= 20) {
+        power = 14;
+    } else {
+        /* 32k buckets. just under the hashpower default. */
+        power = 15;
     }
 
     if (power >= hashpower) {
@@ -780,7 +798,9 @@ void memcached_thread_init(int nthreads) {
 
         threads[i].notify_receive_fd = fds[0];
         threads[i].notify_send_fd = fds[1];
-
+#ifdef EXTSTORE
+        threads[i].storage = arg;
+#endif
         setup_thread(&threads[i]);
         /* Reserve three fds for the libevent base, and two for the pipe */
         stats_state.reserved_fds += 5;

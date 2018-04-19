@@ -21,7 +21,9 @@ memcached_SOURCES = memcached.c memcached.h \
                     trace.h cache.h sasl_defs.h \
                     bipbuffer.c bipbuffer.h \
                     logger.c logger.h \
-                    crawler.c crawler.h
+                    crawler.c crawler.h \
+                    itoa_ljust.c itoa_ljust.h \
+                    slab_automove.c slab_automove.h
 
 if BUILD_CACHE
 memcached_SOURCES += cache.c
@@ -32,8 +34,23 @@ if BUILD_SOLARIS_PRIVS
 memcached_SOURCES += solaris_priv.c
 endif
 
+if BUILD_LINUX_PRIVS
+memcached_SOURCES += linux_priv.c
+endif
+
+if BUILD_OPENBSD_PRIVS
+memcached_SOURCES += openbsd_priv.c
+endif
+
 if ENABLE_SASL
 memcached_SOURCES += sasl_defs.c
+endif
+
+if ENABLE_EXTSTORE
+memcached_SOURCES += extstore.c extstore.h \
+                     crc32c.c crc32c.h \
+                     storage.c storage.h \
+                     slab_automove_extstore.c slab_automove_extstore.h
 endif
 
 memcached_debug_SOURCES = $(memcached_SOURCES)
@@ -45,6 +62,11 @@ memcached_LDADD =
 memcached_DEPENDENCIES =
 memcached_debug_DEPENDENCIES =
 CLEANFILES=
+
+if BUILD_LINUX_PRIVS
+memcached_LDADD += -lseccomp
+memcached_debug_LDADD += -lseccomp
+endif
 
 if BUILD_DTRACE
 BUILT_SOURCES += memcached_dtrace.h
@@ -58,6 +80,8 @@ memcached_debug_LDADD += memcached_debug_dtrace.o
 memcached_debug_DEPENDENCIES += memcached_debug_dtrace.o
 CLEANFILES += memcached_dtrace.o memcached_debug_dtrace.o
 endif
+
+memcached_debug_CFLAGS += -DMEMCACHED_DEBUG
 
 memcached_dtrace.h: memcached_dtrace.d
 	${DTRACE} -h -s memcached_dtrace.d
@@ -81,7 +105,11 @@ MOSTLYCLEANFILES = *.gcov *.gcno *.gcda *.tcov
 test:	memcached-debug sizes testapp
 	$(srcdir)/sizes
 	$(srcdir)/testapp
-	prove $(srcdir)/t
+	@if test -n "${PARALLEL}"; then \
+	  prove $(srcdir)/t -j ${PARALLEL}; \
+	else \
+	  prove $(srcdir)/t; \
+	fi
 	@if test `basename $(PROFILER)` = "gcov"; then \
 	  for file in memcached_debug-*.gc??; do \
 	    mv -f $$file `echo $$file | sed 's/memcached_debug-//'`; \

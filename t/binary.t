@@ -2,12 +2,12 @@
 
 use strict;
 use warnings;
-use Test::More tests => 4945;
+use Test::More;
 use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
 
-my $server = new_memcached();
+my $server = new_memcached("-o no_modern");
 ok($server, "started the server");
 
 # Based almost 100% off testClient.py which is:
@@ -122,7 +122,7 @@ $empty->('y');
 
 {
     # diag "Some chunked item tests";
-    my $s2 = new_memcached('-o slab_chunk_max=4096');
+    my $s2 = new_memcached('-o no_modern,slab_chunk_max=4096');
     ok($s2, "started the server");
     my $m2 = MC::Client->new($s2);
     # Specifically trying to cross the chunk boundary when internally
@@ -135,6 +135,11 @@ $empty->('y');
         my (undef, $gval, undef) = $m2->get('t');
         ok($gval eq $val, $gval . " = " . $val);
     }
+
+    my $cval = ('d' x 8100) . '123';
+
+    my $m3 = $s2->new_sock;
+    mem_get_is($m3, 't', $cval, "large value set from bin fetched from ascii");
 }
 
 {
@@ -436,7 +441,7 @@ $mc->silent_mutation(::CMD_ADDQ, 'silentadd', 'silentaddval');
     my %stats = $mc->stats('settings');
 
     is(1024, $stats{'maxconns'});
-    is('NULL', $stats{'domain_socket'});
+    isnt('NULL', $stats{'domain_socket'});
     is('on', $stats{'evictions'});
     is('yes', $stats{'cas_enabled'});
     is('yes', $stats{'flush_enabled'});
@@ -508,6 +513,8 @@ my %stats = $mc->stats('detail dump');
     };
     ok($@->einval, "Invalid key length");
 }
+
+done_testing();
 
 # ######################################################################
 # Test ends around here.

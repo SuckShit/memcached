@@ -18,7 +18,7 @@ void uriencode_init(void) {
         if (isalnum(x) || x == '-' || x == '.' || x == '_' || x == '~') {
             uriencode_map[x] = NULL;
         } else {
-            snprintf(str, 4, "%%%02X", x);
+            snprintf(str, 4, "%%%02hhX", (unsigned char)x);
             uriencode_map[x] = str;
             str += 3; /* lobbing off the \0 is fine */
         }
@@ -129,6 +129,23 @@ bool safe_strtol(const char *str, int32_t *out) {
 
     if (xisspace(*endptr) || (*endptr == '\0' && endptr != str)) {
         *out = l;
+        return true;
+    }
+    return false;
+}
+
+bool safe_strtod(const char *str, double *out) {
+    assert(out != NULL);
+    errno = 0;
+    *out = 0;
+    char *endptr;
+    double d = strtod(str, &endptr);
+    if ((errno == ERANGE) || (str == endptr)) {
+        return false;
+    }
+
+    if (xisspace(*endptr) || (*endptr == '\0' && endptr != str)) {
+        *out = d;
         return true;
     }
     return false;
